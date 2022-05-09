@@ -1,0 +1,377 @@
+---
+title: "IRFinder"
+author: "Florent Chuffart"
+date: "`r Sys.Date()`"
+output: 
+  rmarkdown::html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+---
+
+
+
+```{r, echo=FALSE, eval=TRUE}
+knitr::opts_chunk$set(collapse=TRUE, comment = "#>", fig.width=9, fig.height=6, eval=TRUE, echo=FALSE, results="hide")
+```
+
+# Method
+
+1. We filter IRs according to IR change and adjusted p-value. Selected IRs are exported in .xlsx file named according to the condition and color.
+2. We pool IRs that have been highlighted in at least one of the following volcano plots. Then we focus on this reduced list of IRs. 
+3. We filter this reduced list of IRs according the correlation of their IR.change across conditions. Selected IRs are exported in .xlsx file named according to the condition and color.
+
+```{r}
+library(DESeq2)
+source("/summer/epistorage/opt/IRFinder-1.3.0/bin/DESeq2Constructor.R")  #Load IRFinder-related function
+
+# results = read.table("/summer/epistorage/opt/IRFinder-1.3.0/filePaths.txt")
+# paths = as.vector(results$V1)                                            # File names must be saved in a vector
+# experiment = read.table("/summer/epistorage/opt/IRFinder-1.3.0/experiment.txt",header=T)
+# experiment$Condition=factor(experiment$Condition,levels=c("NHS","HS"))    # Set NHS as the baseline in the analysis
+# rownames(experiment)=NULL                                                # Force removing rownames
+#
+# # WARNING: make sure the rownames of `experiment` is set to NULL.
+# # WARNING: users MUST check if the order of files in the `path` matches the order of samples in `experiment` before continue
+```
+
+
+# Design
+
+```{r design, results="verbatim"}
+design = read.table("design.txt", header=TRUE, stringsAsFactors=FALSE); 
+rownames(design) = design$SampleNames
+design
+```
+
+
+```{r models}
+da_questions = list(
+  q1 = list(Lines=unique(design$Lines),         Condition=list(c("NHS", "HS"), c("NHS", "R3"))),
+  q2 = list(Condition=unique(design$Condition), Lines=list(c("WT", "C1"), c("WT", "M3")))
+)
+
+if (!exists("res.diffs")) {
+  res.diffs = list()
+  for (nq in names(da_questions)) {
+    q = da_questions[[nq]]
+    for (var1 in unique(design[[names(q)[1]]])) {
+      for (vars2 in q[[2]]) {
+        idx_sample = design[design[[names(q)[1]]] %in% var1 & design[[names(q)[2]]] %in% vars2, ]$SampleNames
+        print(design[idx_sample,])
+    
+        experiment = design[idx_sample,]
+        paths = experiment$paths
+        experiment = experiment[, c("SampleNames", names(q)[2])]
+        rownames(experiment) = NULL
+        experiment[[names(q)[2]]] = factor(experiment[[names(q)[2]]],levels=vars2)    # Set NHS as the baseline in the analysis
+        if (!exists("mDESeqDataSetFromIRFinder")) {mDESeqDataSetFromIRFinder = memoise::memoise(DESeqDataSetFromIRFinder)}
+        metaList = mDESeqDataSetFromIRFinder(filePaths=paths, designMatrix=experiment, designFormula=~1)
+        # The above line generate a meta list contains four slots
+        # First slot is a DESeq2 Object that can be directly pass to DESeq2 analysis.  
+        # Second slot is a matrix for trimmed mean of intron depth
+        # Third slot  is a matrix for correct splicing depth flanking introns
+        # Fourth slot is a matrix for maximum splicing reads at either ends of introns
+        # We build a “null” regression model on the interception only. 
+        # A “real” model can be assigned either here directly, or in the downstream step. See below
+
+        dds = metaList$DESeq2Object                       # Extract DESeq2 Object with normalization factors ready
+        colData(dds)                                      # Check design of matrix
+
+        # DataFrame with 8 rows and 3 columns
+        #     SampleNames    Condition    IRFinder
+        #     <factor>        <factor>    <factor>
+        # 1   Sample1               WT          IR
+        # 2   Sample2               WT          IR
+        # 3   Sample3               KO          IR
+        # 4   Sample4               KO          IR
+        # 5   Sample1               WT          Splice
+        # 6   Sample2               WT          Splice
+        # 7   Sample3               KO          Splice
+        # 8   Sample4               KO          Splice
+
+        # Please note that sample size has been doubled and one additional column "IRFinder" has been added.
+        # This is because IRFinder considers each sample has two sets of counts: one for reads inside intronic region and one for reads at splice site, indicating by "IR" and "Splice" respectively.
+        # "IRFinder" is considered as an additional variable in the GLM model.
+        # Please also be aware that size factors have been set to 1 for all samples. Re-estimation of size factors is NOT recommended and is going to bias the result.
+        # More details at the end of the instruction.
+
+        design(dds) = formula(paste0("~", names(q)[2], "+", names(q)[2], ":IRFinder"))     # Build a formula of GLM. Read below for more details. 
+        if (!exists("mDESeq")) {mDESeq = memoise::memoise(DESeq)}
+        dds = mDESeq(dds)                                  # Estimate parameters and fit to model
+        resultsNames(dds)                                 # Check the actual variable name assigned by DESeq2
+
+        # [1] "Intercept"                   "Condition_KO_vs_WT"
+        # [3] "ConditionWT.IRFinderIR" "ConditionKO.IRFinderIR"
+
+        res.ctrl = results(dds, name=paste0(names(q)[2], vars2[1], ".IRFinderIR"))
+        # This tests if the number of IR reads are significantly different from normal spliced reads, in the NHS samples.
+        # We might only be interested in the "log2FoldChange" column, instead of the significance.
+        # This is because "log2FoldChange" represents log2(number of intronic reads/number of normal spliced reads).
+        # So we the value of (intronic reads/normal spliced reads) by
+    
+        ctrl.IR_vs_Splice = 2^res.ctrl$log2FoldChange
+    
+        # As IR ratio is calculated as (intronic reads/(intronic reads+normal spliced reads))
+        # We can easily convert the above value to IR ratio by
+    
+        IRratio.ctrl = ctrl.IR_vs_Splice/(1+ctrl.IR_vs_Splice)
+    
+        # Similarly, we can get IR ratio in the HS samples
+        res.case = results(dds, name=paste0(names(q)[2], vars2[2], ".IRFinderIR"))
+        case.IR_vs_Splice=2^res.case$log2FoldChange
+        IRratio.case = case.IR_vs_Splice/(1+case.IR_vs_Splice)
+
+        # Finally we can test the difference of (intronic reads/normal spliced reads) ratio between NHS and HS
+        if (!exists("mDESeq2_results")) {mDESeq2_results = memoise::memoise(DESeq2::results)}
+        res.diff = mDESeq2_results(dds, contrast=as.list(paste0(names(q)[2], vars2, ".IRFinderIR")))  
+    
+        # We can plot the changes of IR ratio with p values
+        # In this example we defined significant IR changes as
+        # 1) IR changes no less than 10% (both direction) and 
+        # 2) with adjusted p values less than 0.05
+
+        res.diff$IR.change = IRratio.case - IRratio.ctrl
+    
+        key = paste0("in_", var1, "_", paste(vars2, collapse="_ref_vs_"))
+        res.diffs[[key]] = res.diff
+      }
+    }    
+  }
+}
+
+```
+
+# Volcano plots
+
+
+```{r volcano}
+layout(matrix(1:6, 2), respect=TRUE)
+
+idx = c(
+  "CLK1/ENSG00000013441/clean/2:200859746-200860124:-",
+  "CLK1/ENSG00000013441/clean/2:200859747-200861237:-",
+  "CLK1/ENSG00000013441/clean/2:200860215-200861237:-",
+  "TAF1D/ENSG00000166012/clean/11:93738499-93739236:-",
+  "DNAJB9/ENSG00000128590/clean/7:108570103-108571716:+",
+  "DNAJB9/ENSG00000128590/clean/7:108571943-108572898:+"
+)
+
+intercepts_up = c(
+  in_WT_NHS_ref_vs_HS=5,  
+  in_WT_NHS_ref_vs_R3=4,  
+  in_C1_NHS_ref_vs_HS=4,  
+  in_C1_NHS_ref_vs_R3=4,    
+  in_M3_NHS_ref_vs_HS=5,  
+  in_M3_NHS_ref_vs_R3=5, 
+
+  in_NHS_WT_ref_vs_C1=3,  
+  in_NHS_WT_ref_vs_M3=3,  
+   in_HS_WT_ref_vs_C1=2,  
+   in_HS_WT_ref_vs_M3=3,    
+   in_R3_WT_ref_vs_C1=4,  
+   in_R3_WT_ref_vs_M3=3, 
+
+  NULL 
+)
+
+intercepts_dw = c(
+  in_WT_NHS_ref_vs_HS=4,  
+  in_WT_NHS_ref_vs_R3=2,  
+  in_C1_NHS_ref_vs_HS=2,  
+  in_C1_NHS_ref_vs_R3=2,  
+  in_M3_NHS_ref_vs_HS=3,  
+  in_M3_NHS_ref_vs_R3=3, 
+
+  in_NHS_WT_ref_vs_C1=1,  
+  in_NHS_WT_ref_vs_M3=3,  
+   in_HS_WT_ref_vs_C1=1,  
+   in_HS_WT_ref_vs_M3=3,    
+   in_R3_WT_ref_vs_C1=2,  
+   in_R3_WT_ref_vs_M3=1, 
+
+
+  NULL 
+)
+
+
+
+
+
+
+
+steep_updw = c(
+  in_WT_NHS_ref_vs_HS=10,  
+  in_WT_NHS_ref_vs_R3=10,  
+  in_C1_NHS_ref_vs_HS=10,  
+  in_C1_NHS_ref_vs_R3=10,    
+  in_M3_NHS_ref_vs_HS=10,  
+  in_M3_NHS_ref_vs_R3=10, 
+
+  in_NHS_WT_ref_vs_C1=5,  
+  in_NHS_WT_ref_vs_M3=5,  
+   in_HS_WT_ref_vs_C1=5,  
+   in_HS_WT_ref_vs_M3=5,    
+   in_R3_WT_ref_vs_C1=5,  
+   in_R3_WT_ref_vs_M3=5, 
+
+  NULL 
+)
+
+
+
+
+myWriteXLS = WriteXLS::WriteXLS
+# myWriteXLS = function(...){}
+  
+irs = list()
+for (nq in names(da_questions)) {
+  irs[[nq]] = list(red=list(), blue=list())
+  q = da_questions[[nq]]
+  for (var1 in unique(design[[names(q)[1]]])) {
+    for (vars2 in q[[2]]) {
+      key = paste0("in_", var1, "_", paste(vars2, collapse="_ref_vs_"))    
+      print(key)
+      res.diff = res.diffs[[key]]    
+      tmpidx_up = rownames(res.diff)[
+        !is.na(res.diff$padj) & !is.na(res.diff$IR.change) &
+        res.diff$IR.change > 0 &
+        -log10(res.diff$padj) > -steep_updw[[key]] *  res.diff$IR.change + intercepts_up[[key]] &
+        TRUE
+      ]
+      tmpidx_dw = rownames(res.diff)[
+        !is.na(res.diff$padj) & !is.na(res.diff$IR.change) &
+        res.diff$IR.change < 0 &
+        -log10(res.diff$padj) > steep_updw[[key]] *  res.diff$IR.change + intercepts_dw[[key]] &
+        TRUE
+      ]
+      irs[[nq]][["red"]][[key]] = tmpidx_up
+      irs[[nq]][["blue"]][[key]] = tmpidx_dw
+
+      prefix = paste0(key, "_full")    
+      tmpdf = as.data.frame(res.diff)
+      head(tmpdf)
+      myWriteXLS(tmpdf, paste0("volcano_", prefix, "_ir.xlsx"), row.names=TRUE, FreezeRow=1, FreezeCol=1)
+      for (k in names(irs[[nq]])) {
+        prefix = paste0(key, "_", k)    
+        tmpdf = as.data.frame(res.diff[irs[[nq]][[k]][[key]],])
+        head(tmpdf)
+        myWriteXLS(tmpdf, paste0("volcano_", prefix, "_ir.xlsx"), row.names=TRUE, FreezeRow=1, FreezeCol=1)
+        write.table(unique(do.call(rbind,strsplit(rownames(tmpdf), "/"))[,1]), paste0("volcano_", prefix, "_genes.txt"), col.names=FALSE, row.names=FALSE, quote=FALSE)
+      }
+    
+      plot(
+        # res.diff$IR.change, -log10(res.diff$pvalue),
+        res.diff$IR.change, -log10(res.diff$padj), 
+        main=paste(var1,"-",  paste(vars2, collapse=" (ref.) vs. "), length(tmpidx_up), length(tmpidx_dw)),
+        col=ifelse(rownames(res.diff) %in% tmpidx_up, 2, ifelse(rownames(res.diff) %in% tmpidx_dw, 4, 1)),
+        # col=adjustcolor("black", alpha.f=0.5),
+        pch=".", 
+        ylim=c(0,20)
+      )
+      text(res.diff[idx,]$IR.change, -log10(res.diff[idx,]$padj), 1:6, col=2) 
+      legend("topleft", paste0("chr", substr(idx, 28, 1000)), pch=as.character(1:6), col=2,cex=.5, pt.cex=.5)
+    }
+  }
+}
+
+# sapply(irs[["red"]], length)
+# length(unique(unlist(irs[["red"]])))
+#
+# sapply(irs[["blue"]], length)
+# length(unique(unlist(irs[["blue"]])))
+#
+```
+
+# Correlation plots
+
+```{r correlation, fig.height=9, eval=TRUE}
+# WT vs. C1 and WT vs. M3 in HS
+# WT vs. C1 and WT vs. M3 in R3
+
+layout(matrix(1:4, 2), respect=TRUE)
+
+idx_clk1 = c(
+  "CLK1/ENSG00000013441/clean/2:200859746-200860124:-",
+  "CLK1/ENSG00000013441/clean/2:200859747-200861237:-",
+  "CLK1/ENSG00000013441/clean/2:200860215-200861237:-",
+  "TAF1D/ENSG00000166012/clean/11:93738499-93739236:-",
+  "DNAJB9/ENSG00000128590/clean/7:108570103-108571716:+",
+  "DNAJB9/ENSG00000128590/clean/7:108571943-108572898:+"
+)
+
+
+for (nq in names(da_questions)) {
+  q = da_questions[[nq]]
+  for (var1 in unique(design[[names(q)[1]]])[-1]) {
+    for (vars2 in q[[2]]) {
+      key1 = paste0("in_", unique(design[[names(q)[1]]])[1], "_", paste(vars2, collapse="_ref_vs_"))
+      key2 = paste0("in_", var1                            , "_", paste(vars2, collapse="_ref_vs_"))
+      print(paste0(key1, key2))
+      res.diff1 = res.diffs[[key1]]    
+      res.diff2 = res.diffs[[key2]]    
+      idx  = unique(c(unlist(irs[[nq]][["red"]][1:2]), unlist(irs[[nq]][["blue"]][1:2])))
+      idxs = list()
+      idxs[["red"    ]] = intersect(idx, rownames(res.diff1)[res.diff1$IR.change > -res.diff2$IR.change & res.diff1$IR.change-.1 > res.diff2$IR.change])
+      idxs[["blue"   ]] = intersect(idx, rownames(res.diff1)[res.diff1$IR.change > -res.diff2$IR.change & res.diff1$IR.change+.1 < res.diff2$IR.change])
+      idxs[["violet" ]] = intersect(idx, rownames(res.diff1)[res.diff1$IR.change < -res.diff2$IR.change & res.diff1$IR.change+.1 < res.diff2$IR.change])
+      idxs[["orange" ]] = intersect(idx, rownames(res.diff1)[res.diff1$IR.change < -res.diff2$IR.change & res.diff1$IR.change-.1 > res.diff2$IR.change])
+
+      cols = rep("black", length(idx))
+      names(cols) = idx
+      for (k in names(idxs)) {
+        cols[idxs[[k]]] = k
+        prefix = paste0(k, "_", unique(design[[names(q)[1]]])[1], "vs", var1, "-",  paste(vars2, collapse="refvs"))    
+        tmpdf = data.frame(idxs[[k]], res.diff1[idxs[[k]],]$IR.change, res.diff2[idxs[[k]],]$IR.change, stringsAsFactors=FALSE)
+        colnames(tmpdf) = c("IR", paste0(c(key1, key2), "_IR.change"))
+        head(tmpdf)
+        myWriteXLS(tmpdf, paste0("correlation_", prefix, "_ir.xlsx"))
+        write.table(unique(do.call(rbind,strsplit(tmpdf$IR, "/"))[,1]), paste0("correlation_", prefix, "_genes.txt"), col.names=FALSE, row.names=FALSE, quote=FALSE)
+      }
+    
+      plot(res.diff1[idx,]$IR.change, res.diff2[idx,]$IR.change, 
+        main=paste0(unique(design[[names(q)[1]]])[1], " vs. ", var1, " - ",  paste(vars2, collapse=" (ref.) vs. "), " (", length(idx), ")"),
+        pch=".", 
+        # col=adjustcolor("black", alpha.f=0.9),
+        col=cols,
+        xlim=c(-1,1), ylim=c(-1,1),
+        xlab=paste0("IR.change ", unique(design[[names(q)[1]]])[1]), ylab=paste0("IR.change ", var1)
+      )
+    
+      idx2 = idx[idx%in%names(cols)[cols!="black"]]
+      points(res.diff1[idx2,]$IR.change, res.diff2[idx2,]$IR.change, 
+        pch=1, 
+        # col=adjustcolor("black", alpha.f=0.9),
+        col=cols[idx2],
+      )
+    
+      # plot(c(-1,1), c(-1,1))
+      abline(a=0, b=1 , col="grey", lty=2)
+      abline(a=0, b=-1, col="grey", lty=2)
+      # text(res.diff1[intersect(idx_clk1, idx),]$IR.change, res.diff2[intersect(idx_clk1, idx),]$IR.change, 1:3, col=2)
+      # legend("topleft", paste0("chr", substr(idx, 28, 1000)), pch=as.character(1:3), col=2)
+      # abline(v=c(-.2,.2), h=c(-.2,.2), col="grey", lty=2)
+      polygon(x=c( 1,  .05,    1),
+              y=c(-1, -.05,  0.9), border="red"    ,col=adjustcolor("red"   , alpha.f=.1) , lty=2)
+      polygon(x=c(-1, -.05,  0.9), 
+              y=c( 1,  .05,    1), border="blue"   ,col=adjustcolor("blue"  , alpha.f=.1) , lty=2)
+      polygon(x=c( 1,  .05, -0.9),
+              y=c(-1, -.05, -  1), border="orange" ,col=adjustcolor("orange", alpha.f=.1) , lty=2)
+      polygon(x=c(-1, -.05, -  1),
+              y=c( 1,  .05, -0.9), border="violet" ,col=adjustcolor("violet", alpha.f=.1) , lty=2)
+              
+              
+    }
+  }
+}
+
+```
+# Session Information
+
+```{r, results="verbatim"}
+sessionInfo()
+```
+
+
+
